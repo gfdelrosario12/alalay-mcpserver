@@ -1,0 +1,9 @@
+{
+	"servers": {
+		"my-mcp-server-94de415a": {
+			"url": "http://localhost:8080/disaster_mcp",
+			"type": "http"
+		},
+	},
+	"inputs": []
+}
