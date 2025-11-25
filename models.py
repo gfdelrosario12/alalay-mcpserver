@@ -48,3 +48,12 @@ class UserStatusUpdate(Base):
     current_situation = Column(Text)
     update_datetime = Column(DateTime(timezone=True), server_default=func.now())
     location = Column(String) 
+
+class RescuerStatus(Base):
+    __tablename__ = "rescuer_status"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    rescuer_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    is_available = Column(Boolean, default=True)
+    last_known_location = Column(Text)
+    last_active = Column(DateTime(timezone=True), server_default=func.now())
