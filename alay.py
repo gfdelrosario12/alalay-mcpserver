@@ -239,7 +239,10 @@ async def hazard_check():
 # --- AI Reasoning ---
 @app.post("/ai/reason", operation_id="ai_reason")
 async def ai_reason(request: AIReasonRequest):
-    # --- Get user ---
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="❌ Missing OPENAI_API_KEY in .env")
+    
     unsafe_users = await fetch_unsafe_users_api()
     user = next((u for u in unsafe_users if u["userId"] == request.userId), None)
     if not user:
@@ -247,14 +250,12 @@ async def ai_reason(request: AIReasonRequest):
 
     lat, lon = user["latitude_loc"], user["longitude_loc"]
 
-    # --- Get hazard data ---
     weather = await get_weather_data(lat, lon)
     earthquake = await get_earthquake_data(lat, lon)
-    local_news = await fetch_local_news("Manila", limit=5)
+    local_news = await fetch_local_news(lat, lon)
 
-    # --- Build prompt for Ollama ---
     prompt = f"""
-You are a hazard-analysis assistant. Analyze the following user and hazard data, 
+You are a hazard-analysis assistant. Analyze the following user, hazard, and local news data,
 then respond with a single JSON object ONLY with keys: risk_level, summary, recommended_action.
 
 USER DATA:
@@ -266,61 +267,50 @@ WEATHER DATA:
 EARTHQUAKE DATA:
 {json.dumps(earthquake)}
 
-LOCAL NEWS (headlines relevant to location):
+LOCAL NEWS:
 {json.dumps(local_news)}
 """
 
-    # --- Call Ollama /api/generate ---
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {"role": "system", "content": "You are a precise hazard assessment AI. Reply ONLY with JSON."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 800
+    }
+
     try:
-        res = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "llama3.1",   # ensure model is installed
-                "prompt": prompt,
-                "stream": False
-            },
-            timeout=60
-        )
+        res = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=60)
         res.raise_for_status()
         data = res.json()
-
-        # Extract AI text safely
-        if "choices" in data and len(data["choices"]) > 0:
-            ai_text = data["choices"][0].get("text", "")
-        else:
-            ai_text = str(data)
-
+        ai_text = data["choices"][0]["message"]["content"]
     except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Ollama call failed: {e}")
+        raise HTTPException(status_code=502, detail=f"OpenAI API call failed: {e}")
 
-    # --- Clean and parse JSON from AI response ---
-    cleaned = re.sub(r"```(?:json)?\n", "", ai_text, flags=re.IGNORECASE)
-    cleaned = re.sub(r"```", "", cleaned)
-
-    # Simple regex to capture the first {...} block
+    # Parse JSON safely
+    cleaned = re.sub(r"```(?:json)?\n?", "", ai_text).replace("```", "")
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     json_str = match.group(0) if match else cleaned.strip()
 
     try:
         ai_json = json.loads(json_str)
     except Exception:
-        # fallback if parsing fails
         ai_json = {
             "risk_level": "High",
             "summary": "Simulated high risk near user location",
             "recommended_action": "Dispatch nearest rescuer immediately"
         }
 
-    # --- Validate keys ---
     required = {"risk_level", "summary", "recommended_action"}
     if not required.issubset(ai_json.keys()):
-        raise HTTPException(
-            status_code=500,
-            detail=f"AI JSON missing required keys: {list(ai_json.keys())}"
-        )
+        raise HTTPException(status_code=500, detail=f"AI JSON missing required keys: {list(ai_json.keys())}")
+
     return {
         "user": user,
-        "hazard_raw": {"weather": weather, "earthquake": earthquake},
+        "hazard_raw": {"weather": weather, "earthquake": earthquake, "news": local_news},
         "analysis": ai_json
     }
 
