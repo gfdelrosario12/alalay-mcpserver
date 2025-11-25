@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta
 import os
 import re
@@ -6,7 +7,7 @@ from typing import Dict, Any
 
 import httpx
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi_mcp import FastApiMCP
@@ -44,6 +45,20 @@ class RescueTask(BaseModel):
     location: Dict[str, float]
     created_at: str
 
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def send_json(self, websocket: WebSocket, message: Dict[str, Any]):
+        await websocket.send_json(message)
+
 # --- Health check ---
 @app.get("/")
 async def root():
@@ -51,6 +66,7 @@ async def root():
 
 # --- API helpers ---
 async def fetch_unsafe_users_api() -> list[Dict[str, Any]]:
+    """"
     url = "https://your-backend.example.com/api/unsafe_users"
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(url)
@@ -58,6 +74,7 @@ async def fetch_unsafe_users_api() -> list[Dict[str, Any]]:
         data = resp.json()
     results = []
     for u in data:
+        /**
         results.append({
             "userId": u["userId"],
             "latitude_loc": u["latitude_loc"],
@@ -65,15 +82,25 @@ async def fetch_unsafe_users_api() -> list[Dict[str, Any]]:
             "is_unsafe": u.get("is_unsafe", True)
         })
     return results
+    """""
+    # Mocked data for demonstration
+    return [
+        {"userId": "user123", "latitude_loc": 14.5995, "longitude_loc": 120.9842, "is_unsafe": True},
+    ]
 
 async def fetch_available_rescuers_api() -> list[Dict[str, Any]]:
+    """
     url = "https://your-backend.example.com/api/available_rescuers"
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(url)
         resp.raise_for_status()
         data = resp.json()
     return data
-
+    """
+    # Mocked data for demonstration
+    return [
+        {"userId": "rescuer456", "latitude_loc": 14.5990, "longitude_loc": 120.9820, "is_available": True},
+    ]
 # --- Weather API ---
 async def get_weather_data(lat: float, lon: float):
     API_KEY = os.getenv("WEATHER_API_KEY")
@@ -112,6 +139,35 @@ async def get_weather_data(lat: float, lon: float):
         raise HTTPException(status_code=500, detail=f"Weather API request failed: {e}")
     except (KeyError, TypeError, ValueError) as e:
         raise HTTPException(status_code=500, detail=f"Error processing weather data: {e}")
+
+# --- News API ---
+async def fetch_local_news(city_name: str, limit: int = 5):
+    API_KEY = os.getenv("NEWS_API_KEY")
+    if not API_KEY:
+        return []
+
+    query = f"{city_name} Philippines"
+    url = f"https://newsapi.org/v2/everything?q={query}&sortBy=publishedAt&language=en&pageSize={limit}&apiKey={API_KEY}"
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+
+        articles = []
+        for a in data.get("articles", []):
+            articles.append({
+                "title": a.get("title"),
+                "description": a.get("description"),
+                "url": a.get("url"),
+                "publishedAt": a.get("publishedAt")
+            })
+        return articles
+
+    except Exception as e:
+        print(f"[News] Failed to fetch news: {e}")
+        return []
 
 # --- Earthquake API ---
 async def get_earthquake_data(lat: float, lon: float, radius_km: int = 1000):
@@ -183,15 +239,20 @@ async def hazard_check():
 # --- AI Reasoning ---
 @app.post("/ai/reason", operation_id="ai_reason")
 async def ai_reason(request: AIReasonRequest):
+    # --- Get user ---
     unsafe_users = await fetch_unsafe_users_api()
     user = next((u for u in unsafe_users if u["userId"] == request.userId), None)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     lat, lon = user["latitude_loc"], user["longitude_loc"]
+
+    # --- Get hazard data ---
     weather = await get_weather_data(lat, lon)
     earthquake = await get_earthquake_data(lat, lon)
+    local_news = await fetch_local_news("Manila", limit=5)
 
+    # --- Build prompt for Ollama ---
     prompt = f"""
 You are a hazard-analysis assistant. Analyze the following user and hazard data, 
 then respond with a single JSON object ONLY with keys: risk_level, summary, recommended_action.
@@ -204,59 +265,65 @@ WEATHER DATA:
 
 EARTHQUAKE DATA:
 {json.dumps(earthquake)}
+
+LOCAL NEWS (headlines relevant to location):
+{json.dumps(local_news)}
 """
 
-    payload = {
-        "model": "llama3.1",
-        "messages": [
-            {"role": "system", "content": "You are a precise hazard assessment AI. Reply ONLY with JSON."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.0,
-        "max_tokens": 800
-    }
-
+    # --- Call Ollama /api/generate ---
     try:
-        res = requests.post("http://localhost:11434/api/chat", json=payload, timeout=60)
+        res = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "llama3.1",   # ensure model is installed
+                "prompt": prompt,
+                "stream": False
+            },
+            timeout=60
+        )
         res.raise_for_status()
         data = res.json()
+
+        # Extract AI text safely
+        if "choices" in data and len(data["choices"]) > 0:
+            ai_text = data["choices"][0].get("text", "")
+        else:
+            ai_text = str(data)
+
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Ollama call failed: {e}")
-    except ValueError:
-        raise HTTPException(status_code=500, detail="Ollama returned invalid JSON.")
 
-    ai_text = None
-    if isinstance(data, dict):
-        if "message" in data and isinstance(data["message"], dict) and "content" in data["message"]:
-            ai_text = data["message"]["content"]
-        elif "choices" in data and len(data["choices"]) > 0:
-            choice = data["choices"][0]
-            if isinstance(choice.get("message"), dict) and "content" in choice["message"]:
-                ai_text = choice["message"]["content"]
-            elif "text" in choice:
-                ai_text = choice["text"]
-    if ai_text is None:
-        ai_text = json.dumps(data)
-
+    # --- Clean and parse JSON from AI response ---
     cleaned = re.sub(r"```(?:json)?\n", "", ai_text, flags=re.IGNORECASE)
     cleaned = re.sub(r"```", "", cleaned)
-    match = re.search(r"\{(?:[^{}]|(?R))*\}", cleaned)
+
+    # Simple regex to capture the first {...} block
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     json_str = match.group(0) if match else cleaned.strip()
 
     try:
         ai_json = json.loads(json_str)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse AI JSON: {e}. Raw text: {cleaned[:1000]}")
+    except Exception:
+        # fallback if parsing fails
+        ai_json = {
+            "risk_level": "High",
+            "summary": "Simulated high risk near user location",
+            "recommended_action": "Dispatch nearest rescuer immediately"
+        }
 
+    # --- Validate keys ---
     required = {"risk_level", "summary", "recommended_action"}
     if not required.issubset(ai_json.keys()):
-        raise HTTPException(status_code=500, detail=f"AI JSON missing required keys: {list(ai_json.keys())}")
-
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI JSON missing required keys: {list(ai_json.keys())}"
+        )
     return {
         "user": user,
         "hazard_raw": {"weather": weather, "earthquake": earthquake},
         "analysis": ai_json
     }
+
 
 # --- AI Reason + Rescue ---
 @app.post("/ai/reason_and_rescue", operation_id="ai_reason_and_rescue")
@@ -304,6 +371,79 @@ async def ai_reason_and_rescue(request: AIReasonRequest):
         "task": new_task,
         "rescuer_assigned": nearest_rescuer["userId"]
     }
+# --- WebSocket Manager ---
+manager = ConnectionManager()
+
+# ----------------- Agent Loop -----------------
+async def agent_loop():
+    while True:
+        print("\n===== AGENTIC AI CYCLE START =====")
+        unsafe_users = await fetch_unsafe_users_api()
+        if not unsafe_users:
+            print("[AI] No unsafe users found.")
+        else:
+            print(f"[AI] Found {len(unsafe_users)} unsafe users")
+
+        for user in unsafe_users:
+            user_id = user["userId"]
+            print(f"\n[AI] Processing user {user_id}")
+
+            try:
+                response = await ai_reason_and_rescue(AIReasonRequest(userId=user_id))
+                analysis = response["analysis"]
+                rescue_created = response.get("rescue_created", False)
+                print(f"[AI] Risk Level: {analysis['risk_level']}")
+                if rescue_created:
+                    print(f"[AI] Rescue Task Created → Rescuer: {response['rescuer_assigned']} Task ID: {response['task']['taskId']}")
+                else:
+                    print("[AI] No rescue task created.")
+
+                # Notify WebSocket clients
+                for ws in manager.active_connections:
+                    await manager.send_json(ws, {
+                        "userId": user_id,
+                        "analysis": analysis,
+                        "rescue_created": rescue_created,
+                        "task": response.get("task")
+                    })
+
+            except Exception as e:
+                print(f"[AI] Error processing user {user_id}: {e}")
+
+        print("===== AGENTIC AI CYCLE END – Waiting 60s =====\n")
+        await asyncio.sleep(60)
+
+
+# --- WebSocket Endpoint ---
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            user_id = data.get("userId")
+
+            if not user_id:
+                await manager.send_json(websocket, {"error": "Missing userId"})
+                continue
+
+            try:
+                # Use your AI Reason + Rescue logic
+                response = await ai_reason_and_rescue(AIReasonRequest(userId=user_id))
+                await manager.send_json(websocket, {"status": "success", "result": response})
+
+            except HTTPException as e:
+                await manager.send_json(websocket, {"status": "error", "detail": e.detail})
+            except Exception as e:
+                await manager.send_json(websocket, {"status": "error", "detail": str(e)})
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+@app.on_event("startup")
+async def start_agent_loop_event():
+    print("🚀 Starting Agent Loop...")
+    asyncio.create_task(agent_loop())
 
 # --- MCP Integration ---
 mcp = FastApiMCP(
