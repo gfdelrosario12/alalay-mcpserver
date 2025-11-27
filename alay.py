@@ -4,7 +4,7 @@ import os
 import re
 import json
 from typing import Dict, Any
-
+import uuid
 import httpx
 import requests
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -17,7 +17,7 @@ from geopy.geocoders import Nominatim
 # Load environment variables
 load_dotenv()
 handled_users = set()  # stores userId of already handled unsafe users
-
+GRAPHQL_URL = os.getenv("GRAPHQL_URL")
 
 app = FastAPI(
     title="Apxml Awesome MCP",
@@ -69,56 +69,148 @@ async def root():
 
 # --- API helpers ---
 async def fetch_unsafe_users_api() -> list[Dict[str, Any]]:
-    """"
-    url = "https://your-backend.example.com/api/unsafe_users"
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        data = resp.json()
-    results = []
-    for u in data:
-        /**
-        results.append({
-            "userId": u["userId"],
-            "latitude_loc": u["latitude_loc"],
-            "longitude_loc": u["longitude_loc"],
-            "is_unsafe": u.get("is_unsafe", True)
-        })
-    return results
-    """""
-    # Mocked data for demonstration
-    # If there's user unsafe return unsafe users
-    # else return empty list
-    users = [
-        { 
-            "userId": "user123",
-            "latitude_loc": 13.8323,
-            "longitude_loc": 120.6329,
-            "is_unsafe": True
-        },
-        {
-            "userId": "user789",
-            "latitude_loc": 14.6000,
-            "longitude_loc": 120.9842,
-            "is_unsafe": True
+    query = """
+    query {
+        unsafeUsers {
+            userId
+            latitude
+            longitude
+            isUnsafe
         }
-    ]
-    return [u for u in users if u["is_unsafe"]]
+    }
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(GRAPHQL_URL, json={"query": query})
+            resp.raise_for_status()
+            result = await resp.json()  # await response
+
+        users_raw = result.get("data", {}).get("unsafeUsers", [])
+        results = []
+        for u in users_raw:
+            results.append({
+                "userId": u["userId"],
+                "latitude_loc": u["latitude"],
+                "longitude_loc": u["longitude"],
+                "is_unsafe": u.get("isUnsafe", True)
+            })
+
+        return [u for u in results if u["is_unsafe"]]
+
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=500, detail=f"Unsafe Users API request failed: {e}")
 
 
 async def fetch_available_rescuers_api() -> list[Dict[str, Any]]:
+    query = """
+    query {
+        availableRescuers {
+            userId
+            latitude
+            longitude
+            isAvailable
+        }
+    }
     """
-    url = "https://your-backend.example.com/api/available_rescuers"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(GRAPHQL_URL, json={"query": query})
+            resp.raise_for_status()
+            result = await resp.json()  # await here
+
+        rescuers_raw = result.get("data", {}).get("availableRescuers", [])
+        results = []
+        for r in rescuers_raw:
+            results.append({
+                "userId": r["userId"],
+                "latitude_loc": r["latitude"],
+                "longitude_loc": r["longitude"],
+                "is_available": r.get("isAvailable", True)
+            })
+
+        # Return only available rescuers
+        return [r for r in results if r["is_available"]]
+
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=500, detail=f"Available Rescuers API request failed: {e}")
+
+# --- Create Rescue Task Helper ---
+async def create_rescue_task_for_user(user):
+    """
+    Creates a rescue task for the given unsafe user by calling the GraphQL mutation.
+    """
+    task_id = str(uuid.uuid4())
+    lat, lon = user["latitude_loc"], user["longitude_loc"]
+
+    # Step 1: Get available rescuers
+    rescuers = await fetch_available_rescuers_api()
+    if not rescuers:
+        return {"rescue_created": False, "message": "No available rescuer nearby."}
+
+    # Step 2: Find nearest rescuer
+    nearest_rescuer = min(
+        rescuers,
+        key=lambda r: geodesic((lat, lon), (r["latitude_loc"], r["longitude_loc"])).km
+    )
+
+    # Step 3: Get AI hazard level
+    try:
+        ai_resp = await ai_reason(AIReasonRequest(userId=user["userId"]))
+        hazard_level = ai_resp.get("analysis", {}).get("risk_level", "unknown").lower()
+    except Exception as e:
+        print(f"[create_rescue_task] AI reasoning failed: {e}")
+        hazard_level = "unknown"
+
+    # Step 4: Prepare GraphQL mutation
+    mutation = """
+    mutation($input: RescueAssignInput!) {
+        createRescueTask(input: $input) {
+            id
+            incidentId
+            assignedRescuerId
+            assignedDatetime
+            status
+            completionDatetime
+            notes
+        }
+    }
+    """
+    incident_id = str(uuid.uuid4())
+    variables = {
+        "input": {
+            "incidentId": incident_id,
+            "rescuerId": nearest_rescuer["userId"],
+            "notes": f"Hazard Level: {hazard_level}, User: {user['userId']}"
+        }
+    }
+
+    # Step 5: Post to GraphQL
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        data = resp.json()
-    return data
-    """
-    # Mocked data for demonstration
-    return [
-        {"userId": "rescuer456", "latitude_loc": 14.5990, "longitude_loc": 120.9820, "is_available": True},
-    ]
+        try:
+            resp = await client.post(
+                GRAPHQL_URL,
+                json={"query": mutation, "variables": variables},
+                headers={"Content-Type": "application/json"}
+            )
+            resp.raise_for_status()
+            data = await resp.json()
+            created_task = data.get("data", {}).get("createRescueTask")
+            if not created_task:
+                return {"rescue_created": False, "message": "GraphQL did not return a task."}
+
+            return {
+                "user": user,
+                "rescue_created": True,
+                "task": created_task,
+                "rescuer_assigned": nearest_rescuer["userId"]
+            }
+
+        except httpx.RequestError as e:
+            return {"rescue_created": False, "message": f"Request failed: {e}"}
+        except Exception as e:
+            return {"rescue_created": False, "message": f"Unexpected error: {e}"}
+
+
 # --- Weather API ---
 async def get_weather_data(lat: float, lon: float):
     API_KEY = os.getenv("WEATHER_API_KEY")
@@ -130,7 +222,7 @@ async def get_weather_data(lat: float, lon: float):
             url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={API_KEY}&units=metric"
             resp = await client.get(url)
             resp.raise_for_status()
-            data = resp.json()
+            data = await resp.json()
 
         weather_desc = data["weather"][0]["main"].lower()
         wind_speed = data["wind"]["speed"]
@@ -162,15 +254,15 @@ async def get_weather_data(lat: float, lon: float):
 geolocator = Nominatim(user_agent="hazard_ai_app")
 
 async def get_city_from_latlon(lat: float, lon: float) -> str:
-    """
-    Returns the city name from latitude and longitude using geopy.
-    """
+    loop = asyncio.get_event_loop()
     try:
-        location = geolocator.reverse((lat, lon), exactly_one=True, language="en")
+        location = await loop.run_in_executor(
+            None,
+            lambda: geolocator.reverse((lat, lon), exactly_one=True, language="en")
+        )
         if not location:
-            return None  # fallback
+            return "Philippines"
         address = location.raw.get("address", {})
-        # Try to get the city, town, or municipality
         return address.get("city") or address.get("town") or address.get("municipality") or address.get("village") or "Philippines"
     except Exception as e:
         print(f"[Geocoding] Failed to get city: {e}")
@@ -206,7 +298,7 @@ async def fetch_local_news(limit: int = 5):
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url, params=params, headers=headers)
             resp.raise_for_status()
-            data = resp.json()
+            data =await resp.json()
 
         articles = []
         for a in data.get("results", []):
@@ -248,7 +340,7 @@ async def get_earthquake_data(lat: float, lon: float, radius_km: int = 200):
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url)
             resp.raise_for_status()
-            data = resp.json()
+            data = await resp.json()
 
         earthquakes = []
         for feature in data.get("features", []):
@@ -288,12 +380,15 @@ async def hazard_check():
         lat, lon = user["latitude_loc"], user["longitude_loc"]
         weather = await get_weather_data(lat, lon)
         earthquake = await get_earthquake_data(lat, lon)
+        local_news = await fetch_local_news(limit=5)
         hazards.append({
             "user_id": user["userId"],
             "location": {"lat": lat, "lon": lon},
             "hazards": {
                 "weather": weather,
-                "earthquakes": earthquake["earthquakes"]
+                "earthquakes": earthquake["earthquakes"],
+                "news": local_news
+
             }
         })
 
@@ -351,13 +446,14 @@ LOCAL NEWS:
         "max_tokens": 800
     }
 
-    try:
-        res = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=60)
-        res.raise_for_status()
-        data = res.json()
-        ai_text = data["choices"][0]["message"]["content"]
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"OpenAI API call failed: {e}")
+    async with httpx.AsyncClient(timeout=60) as client:
+        try:
+            res = await requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=60)
+            res.raise_for_status()
+            data = await res.json()
+            ai_text = data["choices"][0]["message"]["content"]
+        except requests.RequestException as e:
+            raise HTTPException(status_code=502, detail=f"OpenAI API call failed: {e}")
 
     # Parse JSON safely
     cleaned = re.sub(r"```(?:json)?\n?", "", ai_text).replace("```", "")
@@ -395,11 +491,13 @@ async def ai_reason_and_rescue(request: AIReasonRequest):
     lat, lon = user["latitude_loc"], user["longitude_loc"]
     weather = await get_weather_data(lat, lon)
     earthquake = await get_earthquake_data(lat, lon)
+    local_news = await fetch_local_news(limit=5)
     ai_response = await ai_reason(request)
     risk_level = ai_response["analysis"]["risk_level"].lower()
 
     if risk_level != "high":
-        return {"user": user, "hazard_raw": {"weather": weather, "earthquake": earthquake}, "analysis": ai_response["analysis"], "rescue_created": False}
+        verification_needed = True
+        return {"user": user, "hazard_raw": {"weather": weather, "earthquake": earthquake, "news": local_news}, "analysis": ai_response["analysis"], "rescue_created": False,  "verification_needed": verification_needed, "verification_message": "Risk level not high, verification needed before rescue."}
 
     rescuers = await fetch_available_rescuers_api()
     nearest_rescuer = None
@@ -457,19 +555,17 @@ async def agent_loop():
                 rescue_created = response.get("rescue_created", False)
                 print(f"[AI] Risk Level: {analysis['risk_level']}")
                 print(f"[AI] Summary: {analysis['summary']}")
-                print(f"[AI] Get News Articles: {len(response['hazard_raw'].get('news', []))} articles")
                 print(f"[AI] Get Earthquakes: {len(response['hazard_raw'].get('earthquake', {}).get('earthquakes', []))} events")
                 print(f"[AI] Weather Condition: {response['hazard_raw']['weather']['condition'].title()}")  
                 print(f"[AI] City: {await get_city_from_latlon(user['latitude_loc'], user['longitude_loc'])}")
-
                 local_news = response['hazard_raw'].get('news', [])
                 print(f"[AI] {len(local_news)} news articles fetched from Brave:")
-                for n, article in enumerate(local_news, start=1):
-                    print(f"  {n}. {article['title']} ({article['page_age_seconds']}s ago) → {article['url']}")
                 if rescue_created:
                     print(f"[AI] Rescue Task Created → Rescuer: {response['rescuer_assigned']} Task ID: {response['task']['taskId']}")
                 else:
                     print("[AI] No rescue task created.")
+                    # Go ask the user if they are really unsafe as verification
+
 
                 handled_users.add(user_id)
 
@@ -503,9 +599,31 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
 
             try:
-                # Use your AI Reason + Rescue logic
+                # Step 1: AI Reason + Rescue
                 response = await ai_reason_and_rescue(AIReasonRequest(userId=user_id))
-                await manager.send_json(websocket, {"status": "success", "result": response})
+
+                # Step 2: Check if verification is needed
+                if response.get("verification_needed"):
+                    # Ask user if they really need rescue
+                    await manager.send_json(websocket, {
+                        "status": "verification_needed",
+                        "message": response["verification_message"]
+                    })
+
+                    # Wait for user's confirmation
+                    confirmation_data = await websocket.receive_json()
+                    confirm = confirmation_data.get("confirm_unsafe", False, timeout=120)
+
+                    if confirm:
+                        # Create rescue task regardless of AI risk level
+                        forced_response = await create_rescue_task_for_user(response["user"])
+                        await manager.send_json(websocket, {"status": "success", "result": forced_response})
+                    else:
+                        await manager.send_json(websocket, {"status": "no_action", "result": response})
+
+                else:
+                    # No verification needed, just return AI response
+                    await manager.send_json(websocket, {"status": "success", "result": response})
 
             except HTTPException as e:
                 await manager.send_json(websocket, {"status": "error", "detail": e.detail})
@@ -514,6 +632,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+
 
 @app.on_event("startup")
 async def start_agent_loop_event():
