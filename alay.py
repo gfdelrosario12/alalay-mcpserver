@@ -12,9 +12,12 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi_mcp import FastApiMCP
 from geopy.distance import geodesic
+from geopy.geocoders import Nominatim
 
 # Load environment variables
 load_dotenv()
+handled_users = set()  # stores userId of already handled unsafe users
+
 
 app = FastAPI(
     title="Apxml Awesome MCP",
@@ -84,9 +87,24 @@ async def fetch_unsafe_users_api() -> list[Dict[str, Any]]:
     return results
     """""
     # Mocked data for demonstration
-    return [
-        {"userId": "user123", "latitude_loc": 14.5995, "longitude_loc": 120.9842, "is_unsafe": True},
+    # If there's user unsafe return unsafe users
+    # else return empty list
+    users = [
+        { 
+            "userId": "user123",
+            "latitude_loc": 13.8323,
+            "longitude_loc": 120.6329,
+            "is_unsafe": True
+        },
+        {
+            "userId": "user789",
+            "latitude_loc": 14.6000,
+            "longitude_loc": 120.9842,
+            "is_unsafe": True
+        }
     ]
+    return [u for u in users if u["is_unsafe"]]
+
 
 async def fetch_available_rescuers_api() -> list[Dict[str, Any]]:
     """
@@ -140,37 +158,82 @@ async def get_weather_data(lat: float, lon: float):
     except (KeyError, TypeError, ValueError) as e:
         raise HTTPException(status_code=500, detail=f"Error processing weather data: {e}")
 
+# --- Reverse Geocoding helper --- #
+geolocator = Nominatim(user_agent="hazard_ai_app")
+
+async def get_city_from_latlon(lat: float, lon: float) -> str:
+    """
+    Returns the city name from latitude and longitude using geopy.
+    """
+    try:
+        location = geolocator.reverse((lat, lon), exactly_one=True, language="en")
+        if not location:
+            return None  # fallback
+        address = location.raw.get("address", {})
+        # Try to get the city, town, or municipality
+        return address.get("city") or address.get("town") or address.get("municipality") or address.get("village") or "Philippines"
+    except Exception as e:
+        print(f"[Geocoding] Failed to get city: {e}")
+        return "Philippines"
+
 # --- News API ---
-async def fetch_local_news(city_name: str, limit: int = 5):
+from datetime import datetime, timezone, timedelta
+
+async def fetch_local_news(limit: int = 5):
+    """
+    Fetch real-time news from Brave Search for Alalay.
+    Returns a list of news articles with title, description, URL, and page age in seconds.
+    """
     API_KEY = os.getenv("NEWS_API_KEY")
     if not API_KEY:
+        print("[Brave News] Missing API key in environment variables")
         return []
 
-    query = f"{city_name} Philippines"
-    url = f"https://newsapi.org/v2/everything?q={query}&sortBy=publishedAt&language=en&pageSize={limit}&apiKey={API_KEY}"
+    query = '(site:abs-cbn.com OR site:gmanetwork.com) hazard OR disaster OR flood OR fire OR storm OR earthquake"{city}"'
+    url = "https://api.search.brave.com/res/v1/news/search"
+    params = {
+        "q": query,
+        "count": limit * 5,  # fetch extra for filtering if needed
+        "country": "ph",
+        "search_lang": "en"
+    }
+    headers = {
+        "Accept": "application/json",
+        "X-Subscription-Token": API_KEY
+    }
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url)
+            resp = await client.get(url, params=params, headers=headers)
             resp.raise_for_status()
             data = resp.json()
 
         articles = []
-        for a in data.get("articles", []):
+        for a in data.get("results", []):
             articles.append({
                 "title": a.get("title"),
                 "description": a.get("description"),
                 "url": a.get("url"),
-                "publishedAt": a.get("publishedAt")
+                "page_age_seconds": a.get("page_age")
             })
+            if len(articles) >= limit:
+                break
+
+        print(f"[Brave News] Returning {len(articles)} articles")
         return articles
 
+    except httpx.HTTPStatusError as e:
+        print(f"[Brave News] HTTP error: {e.response.status_code} - {e.response.text}")
+        return []
+    except httpx.RequestError as e:
+        print(f"[Brave News] Request error: {e}")
+        return []
     except Exception as e:
-        print(f"[News] Failed to fetch news: {e}")
+        print(f"[Brave News] Unexpected error: {e}")
         return []
 
 # --- Earthquake API ---
-async def get_earthquake_data(lat: float, lon: float, radius_km: int = 1000):
+async def get_earthquake_data(lat: float, lon: float, radius_km: int = 200):
     min_lat, max_lat = 4.6, 21.1
     min_lon, max_lon = 116.9, 126.6
     start_time = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
@@ -252,14 +315,20 @@ async def ai_reason(request: AIReasonRequest):
 
     weather = await get_weather_data(lat, lon)
     earthquake = await get_earthquake_data(lat, lon)
-    local_news = await fetch_local_news(lat, lon)
+    local_news = await fetch_local_news(limit=5)
 
     prompt = f"""
 You are a hazard-analysis assistant. Analyze the following user, hazard, and local news data,
 then respond with a single JSON object ONLY with keys: risk_level, summary, recommended_action.
+Only consider hazards (weather, earthquakes, news) within a 200 km radius of the user's coordinates. 
+Do NOT mention national-level risk. Only consider hazards reported within 200 km of the user's coordinates.
+
 
 USER DATA:
 {json.dumps(user)}
+
+CITY: {await get_city_from_latlon(lat, lon)}
+LAT/LON: {lat}, {lon}
 
 WEATHER DATA:
 {json.dumps(weather)}
@@ -369,12 +438,16 @@ async def agent_loop():
     while True:
         print("\n===== AGENTIC AI CYCLE START =====")
         unsafe_users = await fetch_unsafe_users_api()
-        if not unsafe_users:
-            print("[AI] No unsafe users found.")
-        else:
-            print(f"[AI] Found {len(unsafe_users)} unsafe users")
 
-        for user in unsafe_users:
+        # Filter out already handled users
+        new_unsafe_users = [u for u in unsafe_users if u["userId"] not in handled_users]
+        
+        if not new_unsafe_users:
+            print("[AI] No NEW unsafe users found.")
+        else:
+            print(f"[AI] Found {len(new_unsafe_users)} NEW unsafe users.")
+
+        for user in new_unsafe_users:
             user_id = user["userId"]
             print(f"\n[AI] Processing user {user_id}")
 
@@ -383,10 +456,22 @@ async def agent_loop():
                 analysis = response["analysis"]
                 rescue_created = response.get("rescue_created", False)
                 print(f"[AI] Risk Level: {analysis['risk_level']}")
+                print(f"[AI] Summary: {analysis['summary']}")
+                print(f"[AI] Get News Articles: {len(response['hazard_raw'].get('news', []))} articles")
+                print(f"[AI] Get Earthquakes: {len(response['hazard_raw'].get('earthquake', {}).get('earthquakes', []))} events")
+                print(f"[AI] Weather Condition: {response['hazard_raw']['weather']['condition'].title()}")  
+                print(f"[AI] City: {await get_city_from_latlon(user['latitude_loc'], user['longitude_loc'])}")
+
+                local_news = response['hazard_raw'].get('news', [])
+                print(f"[AI] {len(local_news)} news articles fetched from Brave:")
+                for n, article in enumerate(local_news, start=1):
+                    print(f"  {n}. {article['title']} ({article['page_age_seconds']}s ago) → {article['url']}")
                 if rescue_created:
                     print(f"[AI] Rescue Task Created → Rescuer: {response['rescuer_assigned']} Task ID: {response['task']['taskId']}")
                 else:
                     print("[AI] No rescue task created.")
+
+                handled_users.add(user_id)
 
                 # Notify WebSocket clients
                 for ws in manager.active_connections:
